@@ -76,82 +76,81 @@ class Panfu
 
         $listVo = new ListVO();
         $listVo->list = [];
+
         if(Panfu::$levelDefinitions == null) {
-            // Load the level definitions from levels.json.
             Panfu::$levelDefinitions = json_decode(file_get_contents(__DIR__ . '/levels.json'));
         }
 
         $userData = Panfu::getUserDataById($_SESSION['id']);
 
-        if($userData['social_level'] >= Panfu::$levelDefinitions->maxLevel) {
+        $currentLevel = $userData['social_level'];
+        $currentScore = $userData['social_score'];
+
+        if($currentLevel >= Panfu::$levelDefinitions->maxLevel) {
             return $listVo;
         }
 
-        $level = Panfu::getLevel($userData['social_level']);
+        $level = Panfu::getLevel($currentLevel);
 
-        if($level !== null) {
-            // We can use $level->increment now.
-            $newScore = $userData['social_score'] + $level->increment;
-            $levelUp = new RewardVO();
-            $levelUp->type = "sp";
-            
-            if($newScore >= 100) {
-                // Yay, the user leveled!
+        if(!$level) {
+            Console::log("Missing level definition: " . $currentLevel);
+            return $listVo;
+        }
 
-                // Set the user's score to 0.
-                $newScore = 0;
-                $newLevel = $userData['social_level'] + 1;
-                $levelUp->levelStatus = 1;
-                
-                $levelUp->number = $newScore;
-                array_push($listVo->list, $levelUp);
+        $newScore = $currentScore + $level->increment;
 
-                // Now we push the level rewards, what do they get for leveling?
-                $nextLevel = Panfu::getLevel($newLevel);
+        $levelUp = new RewardVO();
+        $levelUp->type = "sp";
+
+        if($newScore >= $level->requiredScore) {
+
+            $newLevel = $currentLevel + 1;
+            $newScore = 0;
+
+            $levelUp->levelStatus = 1;
+            $levelUp->number = $newScore;
+            $listVo->list[] = $levelUp;
+
+            $nextLevel = Panfu::getLevel($newLevel);
+
+            if($nextLevel && isset($nextLevel->rewards)) {
                 foreach($nextLevel->rewards as $reward) {
+
                     $toPush = new RewardVO();
                     $toPush->type = $reward->type;
+
                     switch($reward->type) {
+
                         case "item":
                             Panfu::addItemToUser((int)$reward->value);
                             $toPush->item = Panfu::getItemVo((int)$reward->value);
                             $toPush->item->active = false;
                             $toPush->item->bought = true;
-                            break;
+                        break;
+
                         case "score":
                             $toPush->number = (int)$reward->value;
-                            break;    
+                        break;
+
                         default:
-                            Console::log("played10 > unknown reward type " . $reward->type . "! (No handling code)");
-                            break;
+                            Console::log("Unknown reward type " . $reward->type);
+                        break;
                     }
-                    array_push($listVo->list, $toPush);
+
+                    $listVo->list[] = $toPush;
                 }
-                
-                // Set the last played 10 time to the current timestamp.
-                // This prevents the user from spamming it to gain quick levels.
-                $_SESSION['lastPlayed10'] = time();
-
-                // Set their level to their new level.
-                Panfu::setSocialLevel($_SESSION['id'], $newLevel);
-            } else {
-                // Huh? What's going on??
-                // Why is this here twice?!
-                $levelUp->number = $newScore;
-                array_push($listVo->list, $levelUp);
-
-                // Well, you see, the game will completely deny any items (with an error)
-                // if you don't send the levelUp first.
-
-                // btw, thank you satoshi for telling me this.
             }
 
-            // Set their score to their new score.
-            Panfu::setSocialScore($_SESSION['id'], $newScore);
+            Panfu::setSocialLevel($_SESSION['id'], $newLevel);
 
         } else {
-            Console::log("Missing level definition: " . $level);
+
+            $levelUp->number = $newScore;
+            $listVo->list[] = $levelUp;
         }
+
+        Panfu::setSocialScore($_SESSION['id'], $newScore);
+        $_SESSION['lastPlayed10'] = time();
 
         return $listVo;
     }
@@ -165,12 +164,15 @@ class Panfu
     public static function getLevel($level)
     {
         if(Panfu::$levelDefinitions == null) {
-            // Load the level definitions from levels.json.
-            Panfu::$levelDefinitions = json_decode(file_get_contents('levels.json'));
+            Panfu::$levelDefinitions = json_decode(file_get_contents(__DIR__ . '/levels.json'));
+        }
+
+        if(!isset(Panfu::$levelDefinitions->levels)) {
+            return null;
         }
 
         foreach(Panfu::$levelDefinitions->levels as $levelObj) {
-            if($levelObj->level == $level) {
+            if((int)$levelObj->level === (int)$level) {
                 return $levelObj;
             }
         }
@@ -239,7 +241,7 @@ class Panfu
             // Let's calculate the days since register.
             $now = time();
             $difference = $now - strtotime($userData['created_at']);
-            $playerInfo->daysOnPanfu = round($difference / (60 * 60 * 24));
+            $playerInfo->daysOnPanfu = round($difference / (30 * 12 * 22));
             return $playerInfo;
         } catch(Exception $e) {
             Console::log("Error getting PlayerInfoVO \o/", $e);
@@ -258,7 +260,7 @@ class Panfu
         require_once AMFPHP_ROOTPATH . "/Services/Vo/FurnitureDataVO.php";
         $response = new FurnitureDataVO();
         $item = Panfu::getItem($itemId);
-        $response->uid = $userId;
+        $response->uid = $_SESSION['id'];
         $response->id = $itemId;
         $response->type = $item['type'];
         $response->active = false;
@@ -273,6 +275,7 @@ class Panfu
 
     public static function getFurniture($userId)
     {
+        $i = 0;
         $pdo = Database::getPDO();
         $statement = $pdo->prepare("SELECT * FROM inventories WHERE user_id = :id");
         $statement->bindParam(":id", $userId, PDO::PARAM_INT);
@@ -427,7 +430,7 @@ class Panfu
     {
         $pdo = Database::getPDO();
         $checkStmt = $pdo->prepare("SELECT * FROM users WHERE name = :name");
-        $checkStmt->bindParam(":name", $username, PDO::PARAM_INT);
+        $checkStmt->bindParam(":name", $username, PDO::PARAM_STR);
         $checkStmt->execute();
         if ($checkStmt->rowCount() == 0) {
             return true;
@@ -679,7 +682,7 @@ class Panfu
         if(!Panfu::usernameNotTaken($username)) {
             $pdo = Database::getPDO();
             $userStatement = $pdo->prepare("SELECT * FROM users WHERE name = :name");
-            $userStatement->bindParam(":name", $username, PDO::PARAM_INT);
+            $userStatement->bindParam(":name", $username, PDO::PARAM_STR);
             $userStatement->execute();
             $userData = $userStatement->fetch();
             return $userData;
@@ -833,7 +836,7 @@ class Panfu
     public static function addItemToUser($itemId, $active = false)
     {
         $pdo = Database::getPDO();
-        $insert = $pdo->prepare("INSERT INTO inventories (user_id, item_id, active, bought) VALUE (:userId, :itemId, :active, true)");
+        $insert = $pdo->prepare("INSERT INTO inventories (user_id, item_id, active, bought) VALUES (:userId, :itemId, :active, true)");
         $insert->bindParam(":userId", $_SESSION['id'], PDO::PARAM_INT);
         $insert->bindParam(":itemId", $itemId, PDO::PARAM_INT);
         $insert->bindParam(":active", $active, PDO::PARAM_INT);
