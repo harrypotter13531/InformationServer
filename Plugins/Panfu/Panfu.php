@@ -16,6 +16,28 @@ class Panfu
     private static $levelDefinitions = null;
 
     /**
+     * Returns the current Unix timestamp in nanoseconds.
+     *
+     * hrtime(true) is monotonic/high-resolution but is not a Unix timestamp,
+     * so clock_gettime(CLOCK_REALTIME) is preferred when available.
+     */
+    private static function nowNanoseconds()
+    {
+        if (function_exists('clock_gettime') && defined('CLOCK_REALTIME')) {
+            $time = clock_gettime(CLOCK_REALTIME);
+            return ($time['sec'] * 1000000000) + $time['nsec'];
+        }
+
+        if (function_exists('hrtime')) {
+            // Fallback: high-resolution elapsed time, not Unix epoch time.
+            return hrtime(true);
+        }
+
+        return (int) floor(microtime(true) * 1000000000);
+    }
+
+
+    /**
      * Sets and returns a session ticket for the user.
      * @author Altro50 <altro50@msn.com>
      * @return SecurityChatItemVO[]
@@ -76,81 +98,82 @@ class Panfu
 
         $listVo = new ListVO();
         $listVo->list = [];
-
         if(Panfu::$levelDefinitions == null) {
+            // Load the level definitions from levels.json.
             Panfu::$levelDefinitions = json_decode(file_get_contents(__DIR__ . '/levels.json'));
         }
 
         $userData = Panfu::getUserDataById($_SESSION['id']);
 
-        $currentLevel = $userData['social_level'];
-        $currentScore = $userData['social_score'];
-
-        if($currentLevel >= Panfu::$levelDefinitions->maxLevel) {
+        if($userData['social_level'] >= Panfu::$levelDefinitions->maxLevel) {
             return $listVo;
         }
 
-        $level = Panfu::getLevel($currentLevel);
+        $level = Panfu::getLevel($userData['social_level']);
 
-        if(!$level) {
-            Console::log("Missing level definition: " . $currentLevel);
-            return $listVo;
-        }
+        if($level !== null) {
+            // We can use $level->increment now.
+            $newScore = $userData['social_score'] + $level->increment;
+            $levelUp = new RewardVO();
+            $levelUp->type = "sp";
+            
+            if($newScore >= 800) {
+                // Yay, the user leveled!
 
-        $newScore = $currentScore + $level->increment;
+                // Set the user's score to 0.
+                $newScore = 1;
+                $newLevel = $userData['social_level'] + 1;
+                $levelUp->levelStatus = 1;
+                
+                $levelUp->number = $newScore;
+                array_push($listVo->list, $levelUp);
 
-        $levelUp = new RewardVO();
-        $levelUp->type = "sp";
-
-        if($newScore >= $level->requiredScore) {
-
-            $newLevel = $currentLevel + 1;
-            $newScore = 0;
-
-            $levelUp->levelStatus = 1;
-            $levelUp->number = $newScore;
-            $listVo->list[] = $levelUp;
-
-            $nextLevel = Panfu::getLevel($newLevel);
-
-            if($nextLevel && isset($nextLevel->rewards)) {
+                // Now we push the level rewards, what do they get for leveling?
+                $nextLevel = Panfu::getLevel($newLevel);
                 foreach($nextLevel->rewards as $reward) {
-
                     $toPush = new RewardVO();
                     $toPush->type = $reward->type;
-
                     switch($reward->type) {
-
                         case "item":
                             Panfu::addItemToUser((int)$reward->value);
                             $toPush->item = Panfu::getItemVo((int)$reward->value);
                             $toPush->item->active = false;
                             $toPush->item->bought = true;
-                        break;
-
+                            break;
                         case "score":
                             $toPush->number = (int)$reward->value;
-                        break;
-
+                            break;    
                         default:
-                            Console::log("Unknown reward type " . $reward->type);
-                        break;
+                            Console::log("played10 > unknown reward type " . $reward->type . "! (No handling code)");
+                            break;
                     }
-
-                    $listVo->list[] = $toPush;
+                    array_push($listVo->list, $toPush);
                 }
+                
+                // Set the last played 10 time to the current timestamp.
+                // This prevents the user from spamming it to gain quick levels.
+                $_SESSION['lastPlayed10'] = time();
+
+                // Set their level to their new level.
+                Panfu::setSocialLevel($_SESSION['id'], $newLevel);
+            } else {
+                // Huh? What's going on??
+                // Why is this here twice?!
+                $levelUp->number = $newScore;
+                array_push($listVo->list, $levelUp);
+
+                // Well, you see, the game will completely deny any items (with an error)
+                // if you don't send the levelUp first.
+
+                // btw, thank you satoshi for telling me this.
             }
 
-            Panfu::setSocialLevel($_SESSION['id'], $newLevel);
+            // Set their score to their new score.
+            Panfu::setSocialScore($_SESSION['id'], $newScore);
 
         } else {
-
-            $levelUp->number = $newScore;
-            $listVo->list[] = $levelUp;
+            Console::log("Missing level definition: " . $level);
         }
-
-        Panfu::setSocialScore($_SESSION['id'], $newScore);
-        $_SESSION['lastPlayed10'] = time();
 
         return $listVo;
     }
@@ -164,15 +187,12 @@ class Panfu
     public static function getLevel($level)
     {
         if(Panfu::$levelDefinitions == null) {
+            // Load the level definitions from levels.json.
             Panfu::$levelDefinitions = json_decode(file_get_contents(__DIR__ . '/levels.json'));
         }
 
-        if(!isset(Panfu::$levelDefinitions->levels)) {
-            return null;
-        }
-
         foreach(Panfu::$levelDefinitions->levels as $levelObj) {
-            if((int)$levelObj->level === (int)$level) {
+            if($levelObj->level == $level) {
                 return $levelObj;
             }
         }
@@ -241,7 +261,7 @@ class Panfu
             // Let's calculate the days since register.
             $now = time();
             $difference = $now - strtotime($userData['created_at']);
-            $playerInfo->daysOnPanfu = round($difference / (30 * 12 * 22));
+            $playerInfo->daysOnPanfu = round($difference / (60 * 60 * 24));
             return $playerInfo;
         } catch(Exception $e) {
             Console::log("Error getting PlayerInfoVO \o/", $e);
@@ -260,7 +280,7 @@ class Panfu
         require_once AMFPHP_ROOTPATH . "/Services/Vo/FurnitureDataVO.php";
         $response = new FurnitureDataVO();
         $item = Panfu::getItem($itemId);
-        $response->uid = $_SESSION['id'];
+        $response->uid = (int)$_SESSION["id"];
         $response->id = $itemId;
         $response->type = $item['type'];
         $response->active = false;
@@ -275,12 +295,12 @@ class Panfu
 
     public static function getFurniture($userId)
     {
-        $i = 0;
         $pdo = Database::getPDO();
         $statement = $pdo->prepare("SELECT * FROM inventories WHERE user_id = :id");
         $statement->bindParam(":id", $userId, PDO::PARAM_INT);
         $statement->execute();
         $items = [];
+        $i = 0;
         if($statement->rowCount() > 0) {
             foreach ($statement as $inventoryEntry) {
                 $item = Panfu::getItem($inventoryEntry['item_id']);
@@ -714,7 +734,7 @@ class Panfu
                     $states[$i]->cathegoryId = $state['category'];
                     $states[$i]->nameId = $state['name'];
                     $states[$i]->stateValue = $state['value'];
-                    $states[$i]->lastChanged = $state['last_changed'] * 100;
+                    $states[$i]->lastChanged = (int)$state['last_changed'];
                     $i++;
                 }
             }
@@ -734,7 +754,9 @@ class Panfu
     {
         require_once AMFPHP_ROOTPATH . "/Services/Vo/StateVO.php";
         $pdo = Database::getPDO();
-        $timestamp = round(microtime(true));
+        $timestampNanoseconds = self::nowNanoseconds();
+        // Keep the database value compatible with the existing integer field.
+        $timestamp = (int) floor($timestampNanoseconds / 1000000);
         if(Panfu::stateExists($category, $name)) {
             $update = $pdo->prepare("UPDATE states SET value = :value, last_changed = :lastChanged WHERE user_id = :playerId AND category = :category AND name = :name");
             $update->bindParam(":value", $value);
@@ -757,7 +779,7 @@ class Panfu
         $state->nameId = $name;
         $state->stateValue = $value;
         $state->cathegoryId = $category;
-        $state->lastChanged = $timestamp * 100;
+        $state->lastChanged = $timestampNanoseconds;
         return $state;
     }
 
@@ -788,7 +810,7 @@ class Panfu
     public static function canAfford($price)
     {
         $currentUser = Panfu::getUserDataById($_SESSION['id']);
-        if($currentUser['coins'] > $price) {
+        if($currentUser['coins'] >= $price) {
             return true;
         }
         return false;
@@ -836,7 +858,7 @@ class Panfu
     public static function addItemToUser($itemId, $active = false)
     {
         $pdo = Database::getPDO();
-        $insert = $pdo->prepare("INSERT INTO inventories (user_id, item_id, active, bought) VALUES (:userId, :itemId, :active, true)");
+        $insert = $pdo->prepare("INSERT INTO inventories (user_id, item_id, active, bought) VALUE (:userId, :itemId, :active, true)");
         $insert->bindParam(":userId", $_SESSION['id'], PDO::PARAM_INT);
         $insert->bindParam(":itemId", $itemId, PDO::PARAM_INT);
         $insert->bindParam(":active", $active, PDO::PARAM_INT);
@@ -992,24 +1014,22 @@ class Panfu
      */
     public static function undoLeet($text)
     {
-        $text = str_split($text);
-        $leet_replace = array();
-        $leet_replace[0] = "o";
-        $leet_replace[1] = "l";
-        $leet_replace[2] = "z";
-        $leet_replace[3] = "e";
-        $leet_replace[4] = "a";
-        $leet_replace[5] = "s";
-        $leet_replace[6] = "b";
-        $leet_replace[7] = "t";
-        $leet_replace[8] = "b";
-        $leet_replace[9] = "p";
-        $changedText = "";
-        foreach($text as $letter) {
-            if(is_numeric($letter))
-                $changedText .= str_ireplace(array_keys($leet_replace), array_values($leet_replace), $letter);
-            else
-                $changedText .= $letter;
+        $leet_replace = array(
+            '0' => 'o',
+            '1' => 'l',
+            '2' => 'z',
+            '3' => 'e',
+            '4' => 'a',
+            '5' => 's',
+            '6' => 'b',
+            '7' => 't',
+            '8' => 'b',
+            '9' => 'p'
+        );
+
+        $changedText = '';
+        foreach (str_split($text) as $letter) {
+            $changedText .= $leet_replace[$letter] ?? $letter;
         }
         return $changedText;
     }
